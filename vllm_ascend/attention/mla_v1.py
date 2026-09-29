@@ -83,6 +83,24 @@ def _npu_mla_prolog_v3_k3(**kwargs):
     return torch.ops._C_ascend.npu_mla_prolog_v3_k3(**kwargs)
 
 
+def _is_draft_model_during_init(vllm_config: VllmConfig) -> bool:
+    """Identify an MLA draft backend during model construction.
+
+    Some draft runtime configs expose ``runner_type="draft"``. Eagle-family
+    draft models are constructed inside
+    ``set_model_tag("eagle_head")`` while the current ``vllm_config`` can
+    still retain the target model's ``runner_type="generate"``. This occurs
+    in Eagle loading paths independently of the selected model runner. Check
+    both identities so draft MLA backends disable MLAPO while target-model
+    MLAPO behavior remains unchanged.
+    """
+    # Import inside the helper: set_model_tag updates this module attribute at
+    # draft-model construction time.
+    from vllm.compilation.backends import model_tag
+
+    return model_tag == "eagle_head" or vllm_config.model_config.runner_type == "draft"
+
+
 class AscendMLABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -874,7 +892,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.ring_mla_mask_size = 512
 
         self.speculative_config = self.vllm_config.speculative_config
-        self.is_draft_model = self.vllm_config.model_config.runner_type == "draft"
+        self.is_draft_model = _is_draft_model_during_init(self.vllm_config)
         self.enable_mlapo = not self.is_draft_model and enabling_mlapo(self.vllm_config)
 
         self.layer_name = kwargs.get("layer_name")

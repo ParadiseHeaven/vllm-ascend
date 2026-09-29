@@ -20,6 +20,7 @@ from vllm_ascend.attention.mla_v1 import (
     ChunkedContextMetadata,
     DecodeMLAPreprocessResult,
     PrefillMLAPreprocessResult,
+    _is_draft_model_during_init,
     _mla_nope_zero_rope,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, PreprocessType, mark_fused_preprocess_weights
@@ -1613,35 +1614,8 @@ class TestAscendMLAImpl(TestBase):
         )
         self.impl.fa_quant_layer = False
 
-    def test_init(self):
-        self.assertEqual(self.impl.num_heads, 256)
-        self.assertEqual(self.impl.head_size, 1024)
-        self.assertEqual(self.impl.scale, 0.1)
-        self.assertEqual(self.impl.num_kv_heads, 8)
-        self.assertEqual(self.impl.kv_cache_dtype, "auto")
-        self.assertFalse(self.impl.pcp_enabled)
-        self.assertEqual(self.impl.kv_lora_rank, 32)
-        self.assertEqual(self.impl.qk_nope_head_dim, 64)
-        self.assertEqual(self.impl.qk_rope_head_dim, 32)
-        self.assertEqual(self.impl.qk_head_dim, 96)
-        self.assertEqual(self.impl.v_head_dim, 128)
-        self.assertIsNotNone(self.impl.q_proj)
-        self.assertIsNotNone(self.impl.kv_b_proj)
-        self.assertIsNotNone(self.impl.o_proj)
-        self.assertIsNotNone(self.impl.kv_a_proj_with_mqa)
-        self.assertIsNotNone(self.impl.kv_a_layernorm)
-        self.assertEqual(self.impl.num_queries_per_kv, 32)
-        self.assertFalse(self.impl.is_draft_model)
-        # 256 is power of 2, so padding should be 0
-        self.assertEqual(self.impl.num_heads_padded, 256)
-        self.assertEqual(self.impl.head_padding, 0)
-
-    @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=True)
-    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
-    def test_draft_model_disables_mlapo_at_init(self, mock_get_current_vllm_config, mock_enabling_mlapo):
-        self.impl.vllm_config.model_config.runner_type = "draft"
-        mock_get_current_vllm_config.return_value = self.impl.vllm_config
-        impl = AscendMLAImpl(
+    def _new_mla_impl_for_draft_detection(self):
+        return AscendMLAImpl(
             num_heads=self.impl.num_heads,
             head_size=self.impl.head_size,
             scale=self.impl.scale,
@@ -1671,9 +1645,68 @@ class TestAscendMLAImpl(TestBase):
             use_mla_rope=True,
         )
 
+    def test_init(self):
+        self.assertEqual(self.impl.num_heads, 256)
+        self.assertEqual(self.impl.head_size, 1024)
+        self.assertEqual(self.impl.scale, 0.1)
+        self.assertEqual(self.impl.num_kv_heads, 8)
+        self.assertEqual(self.impl.kv_cache_dtype, "auto")
+        self.assertFalse(self.impl.pcp_enabled)
+        self.assertEqual(self.impl.kv_lora_rank, 32)
+        self.assertEqual(self.impl.qk_nope_head_dim, 64)
+        self.assertEqual(self.impl.qk_rope_head_dim, 32)
+        self.assertEqual(self.impl.qk_head_dim, 96)
+        self.assertEqual(self.impl.v_head_dim, 128)
+        self.assertIsNotNone(self.impl.q_proj)
+        self.assertIsNotNone(self.impl.kv_b_proj)
+        self.assertIsNotNone(self.impl.o_proj)
+        self.assertIsNotNone(self.impl.kv_a_proj_with_mqa)
+        self.assertIsNotNone(self.impl.kv_a_layernorm)
+        self.assertEqual(self.impl.num_queries_per_kv, 32)
+        self.assertFalse(self.impl.is_draft_model)
+        # 256 is power of 2, so padding should be 0
+        self.assertEqual(self.impl.num_heads_padded, 256)
+        self.assertEqual(self.impl.head_padding, 0)
+
+    @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=True)
+    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+    def test_draft_model_disables_mlapo_at_init(self, mock_get_current_vllm_config, mock_enabling_mlapo):
+        self.impl.vllm_config.model_config.runner_type = "draft"
+        mock_get_current_vllm_config.return_value = self.impl.vllm_config
+        impl = self._new_mla_impl_for_draft_detection()
+
         self.assertTrue(impl.is_draft_model)
         self.assertFalse(impl.enable_mlapo)
         mock_enabling_mlapo.assert_not_called()
+
+    @patch("vllm.compilation.backends.model_tag", "eagle_head")
+    @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=True)
+    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+    def test_eagle_tag_disables_mlapo_with_shared_target_config(
+        self, mock_get_current_vllm_config, mock_enabling_mlapo
+    ):
+        """Eagle draft MLA layers can retain the target config."""
+        self.assertEqual(self.impl.vllm_config.model_config.runner_type, "generate")
+        mock_get_current_vllm_config.return_value = self.impl.vllm_config
+        impl = self._new_mla_impl_for_draft_detection()
+
+        self.assertTrue(_is_draft_model_during_init(self.impl.vllm_config))
+        self.assertTrue(impl.is_draft_model)
+        self.assertFalse(impl.enable_mlapo)
+        mock_enabling_mlapo.assert_not_called()
+
+    @patch("vllm.compilation.backends.model_tag", "backbone")
+    @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=True)
+    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+    def test_target_model_keeps_mlapo_enabled(self, mock_get_current_vllm_config, mock_enabling_mlapo):
+        self.assertEqual(self.impl.vllm_config.model_config.runner_type, "generate")
+        mock_get_current_vllm_config.return_value = self.impl.vllm_config
+        impl = self._new_mla_impl_for_draft_detection()
+
+        self.assertFalse(_is_draft_model_during_init(self.impl.vllm_config))
+        self.assertFalse(impl.is_draft_model)
+        self.assertTrue(impl.enable_mlapo)
+        mock_enabling_mlapo.assert_called_once_with(self.impl.vllm_config)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     def test_init_head_padding_for_non_power_of_two(self, mock_get_current_vllm_config):
